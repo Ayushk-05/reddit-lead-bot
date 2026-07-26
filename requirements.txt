@@ -1,5 +1,0 @@
-feedparser==6.0.11
-requests==2.32.3
-psycopg[binary]
-google-genai==1.2.0
-python-dotenv==1.0.1
