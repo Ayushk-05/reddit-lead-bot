@@ -31,7 +31,7 @@ import requests
 
 from config import (
     REDDIT_RSS_USER_AGENT, SUBREDDITS, KEYWORD_SCORES,
-    KEYWORD_SCORE_THRESHOLD, POST_LOOKBACK_LIMIT,
+    KEYWORD_SCORE_THRESHOLD, POST_LOOKBACK_LIMIT, REDDIT_FETCH_DELAY,
 )
 from db import post_exists, insert_raw_post
 
@@ -69,9 +69,18 @@ def passes_keyword_filter(title: str, body: str) -> bool:
     return keyword_score(title, body) >= KEYWORD_SCORE_THRESHOLD
 
 
+class RedditRateLimited(Exception):
+    """Raised on a 429 from Reddit's RSS. This is treated as IP-level
+    throttling, not per-subreddit — fetch_new_posts stops the whole run
+    on this rather than continuing to hit the remaining subreddits, which
+    would just collect more 429s and prolong the block."""
+    pass
+
+
 def _fetch_rss(url: str, headers: dict, sub_name: str):
     """GET the RSS feed with one retry on transient server errors (5xx).
-    Returns the response object, or None if both attempts failed."""
+    Returns the response object, or None if the retry also failed.
+    Raises RedditRateLimited on a 429 — not retried, not swallowed."""
     for attempt in (1, 2):
         try:
             resp = requests.get(url, headers=headers, timeout=15)
@@ -84,8 +93,7 @@ def _fetch_rss(url: str, headers: dict, sub_name: str):
             return None
 
         if resp.status_code == 429:
-            logger.warning(f"Rate limited on r/{sub_name}, skipping this run.")
-            return None
+            raise RedditRateLimited(sub_name)
 
         if resp.status_code in RETRYABLE_STATUS_CODES and attempt == 1:
             logger.warning(
@@ -116,7 +124,17 @@ def fetch_new_posts() -> int:
     for sub_name in subs:
         url = RSS_URL_TEMPLATE.format(subreddit=sub_name, limit=POST_LOOKBACK_LIMIT)
         try:
-            resp = _fetch_rss(url, headers, sub_name)
+            try:
+                resp = _fetch_rss(url, headers, sub_name)
+            except RedditRateLimited:
+                logger.warning(
+                    f"Rate limited on r/{sub_name} — treating this as IP-level "
+                    f"throttling and stopping the rest of this run's fetches "
+                    f"rather than hitting {len(subs) - subs.index(sub_name) - 1} "
+                    f"more subreddits into the same block. Will retry next run."
+                )
+                break
+
             if resp is None:
                 continue
             resp.raise_for_status()
@@ -164,9 +182,12 @@ def fetch_new_posts() -> int:
 
         except Exception as e:
             logger.error(f"Failed fetching r/{sub_name}: {e}")
-            continue
 
-        time.sleep(1)  # be polite between subreddit requests
+        finally:
+            # Always pause between requests — including after a failure —
+            # so a bad response doesn't turn into a zero-delay burst at
+            # the remaining subreddits.
+            time.sleep(REDDIT_FETCH_DELAY)
 
     return inserted
 

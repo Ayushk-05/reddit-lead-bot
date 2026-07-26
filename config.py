@@ -15,7 +15,7 @@ GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 # this key, you get access to Pro models and higher rate limits — default to
 # gemini-2.5-pro for better classification/outreach quality. If you're on the
 # plain free tier instead, set this to gemini-2.5-flash in .env.
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-pro")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-pro")
 # Google AI Pro raises your rate limit well above the free tier's ~10 RPM, so
 # this can drop a lot. 1.5s is a conservative buffer, not a hard requirement —
 # lower it further if you're not seeing 429s in the logs.
@@ -27,6 +27,11 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 DATABASE_URL = os.environ["DATABASE_URL"]
 
 MIN_SCORE_TO_NOTIFY = float(os.environ.get("MIN_SCORE_TO_NOTIFY", 6.5))
+# Delay (seconds) between subreddit RSS requests — always applied, whether
+# the previous request succeeded, failed, or got rate-limited. Reddit's RSS
+# 429s appear to be IP-level, not per-subreddit, so this needs to be real
+# spacing, not just a courtesy pause after a good response.
+REDDIT_FETCH_DELAY = float(os.environ.get("REDDIT_FETCH_DELAY", 2.0))
 # Newest N posts per subreddit per run, not a general backlog scan. At a
 # 10-min cron interval this is plenty to catch new posts without re-scanning
 # a wide window every time — the DB dedup (analysis IS NULL) handles the rest.
