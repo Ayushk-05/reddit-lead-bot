@@ -31,7 +31,7 @@ MIN_SCORE_TO_NOTIFY = float(os.environ.get("MIN_SCORE_TO_NOTIFY", 6.5))
 # the previous request succeeded, failed, or got rate-limited. Reddit's RSS
 # 429s appear to be IP-level, not per-subreddit, so this needs to be real
 # spacing, not just a courtesy pause after a good response.
-REDDIT_FETCH_DELAY = float(os.environ.get("REDDIT_FETCH_DELAY", 2.0))
+REDDIT_FETCH_DELAY = float(os.environ.get("REDDIT_FETCH_DELAY", 4))
 # Newest N posts per subreddit per run, not a general backlog scan. At a
 # 10-min cron interval this is plenty to catch new posts without re-scanning
 # a wide window every time — the DB dedup (analysis IS NULL) handles the rest.

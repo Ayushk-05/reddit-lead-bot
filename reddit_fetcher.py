@@ -128,12 +128,9 @@ def fetch_new_posts() -> int:
                 resp = _fetch_rss(url, headers, sub_name)
             except RedditRateLimited:
                 logger.warning(
-                    f"Rate limited on r/{sub_name} — treating this as IP-level "
-                    f"throttling and stopping the rest of this run's fetches "
-                    f"rather than hitting {len(subs) - subs.index(sub_name) - 1} "
-                    f"more subreddits into the same block. Will retry next run."
+                   f"Rate limited on r/{sub_name} — skipping this subreddit and continuing."
                 )
-                break
+                continue
 
             if resp is None:
                 continue
