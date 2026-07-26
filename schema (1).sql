@@ -8,6 +8,11 @@ CREATE TABLE IF NOT EXISTS posts (
     created_utc     TIMESTAMPTZ NOT NULL,
     fetched_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
 
+    -- weighted keyword score at insert time (see config.KEYWORD_SCORES).
+    -- Used to prioritize which candidates spend the limited Gemini budget
+    -- per run (see db.get_unanalyzed_posts, ordered by this descending).
+    keyword_score   INTEGER NOT NULL DEFAULT 0,
+
     -- top-level fields pulled out of `analysis` for fast filtering/sorting
     should_notify   BOOLEAN,
     lead_score      NUMERIC(3,1),            -- 0.0 - 10.0
@@ -23,4 +28,9 @@ CREATE TABLE IF NOT EXISTS posts (
 
 CREATE INDEX IF NOT EXISTS idx_posts_created_utc ON posts (created_utc DESC);
 CREATE INDEX IF NOT EXISTS idx_posts_lead_score ON posts (lead_score DESC);
+CREATE INDEX IF NOT EXISTS idx_posts_keyword_score ON posts (keyword_score DESC);
 CREATE INDEX IF NOT EXISTS idx_posts_analysis_gin ON posts USING GIN (analysis);
+
+-- If upgrading an existing database created before this column existed, run:
+-- ALTER TABLE posts ADD COLUMN IF NOT EXISTS keyword_score INTEGER NOT NULL DEFAULT 0;
+-- CREATE INDEX IF NOT EXISTS idx_posts_keyword_score ON posts (keyword_score DESC);

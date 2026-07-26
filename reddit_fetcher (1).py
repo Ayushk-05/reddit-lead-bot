@@ -7,13 +7,20 @@ for years and they still return live data with zero auth as of mid-2026.
 Trade-offs vs the official API (accepted for a personal tool):
 - RSS only gives you the post body as HTML-escaped summary text, not the raw
   markdown — fine for keyword filtering and LLM classification.
-- No guaranteed rate-limit contract like OAuth has. We fetch politely (small
-  delay between subreddits, identifiable User-Agent) to stay under the radar.
+- No guaranteed rate-limit contract like OAuth has. We fetch politely (delay
+  between subreddits, shuffled order, identifiable User-Agent, retry-once on
+  transient errors) to be a good citizen and reduce the chance of getting
+  blocked, not because any of this is officially sanctioned.
+- RSS isn't guaranteed to be complete — a very busy subreddit can push posts
+  off the feed's limit between polls faster than a 10-min cron catches them.
+  Fine at this scale (10 subs, 10-min interval); just don't assume it's a
+  perfect record of everything posted.
 - If Reddit ever locks this down too, the only fallback is a paid third-party
   provider (Data365, Xpoz, etc.) — swap fetch_new_posts() to call whichever
   wrapper you want to pay for and nothing else in the pipeline changes.
 """
 import time
+import random
 import logging
 import html
 import re
@@ -22,7 +29,10 @@ from datetime import datetime, timezone
 import feedparser
 import requests
 
-from config import REDDIT_RSS_USER_AGENT, SUBREDDITS, KEYWORDS, POST_LOOKBACK_LIMIT
+from config import (
+    REDDIT_RSS_USER_AGENT, SUBREDDITS, KEYWORD_SCORES,
+    KEYWORD_SCORE_THRESHOLD, POST_LOOKBACK_LIMIT,
+)
 from db import post_exists, insert_raw_post
 
 logger = logging.getLogger("reddit_fetcher")
@@ -30,6 +40,7 @@ logger = logging.getLogger("reddit_fetcher")
 RSS_URL_TEMPLATE = "https://www.reddit.com/r/{subreddit}/new/.rss?limit={limit}"
 
 _TAG_RE = re.compile(r"<[^>]+>")
+RETRYABLE_STATUS_CODES = {500, 502, 503, 504}
 
 
 def _strip_html(raw_html: str) -> str:
@@ -48,9 +59,44 @@ def _extract_post_id(entry) -> str:
     return entry.get("id", entry.get("link", ""))
 
 
-def passes_keyword_filter(title: str, body: str) -> bool:
+def keyword_score(title: str, body: str) -> int:
+    """Sum of weighted keyword hits. See KEYWORD_SCORES in config.py."""
     text = f"{title} {body}".lower()
-    return any(kw in text for kw in KEYWORDS)
+    return sum(weight for kw, weight in KEYWORD_SCORES.items() if kw in text)
+
+
+def passes_keyword_filter(title: str, body: str) -> bool:
+    return keyword_score(title, body) >= KEYWORD_SCORE_THRESHOLD
+
+
+def _fetch_rss(url: str, headers: dict, sub_name: str):
+    """GET the RSS feed with one retry on transient server errors (5xx).
+    Returns the response object, or None if both attempts failed."""
+    for attempt in (1, 2):
+        try:
+            resp = requests.get(url, headers=headers, timeout=15)
+        except requests.RequestException as e:
+            if attempt == 1:
+                logger.warning(f"Network error on r/{sub_name}, retrying in 2.5s: {e}")
+                time.sleep(2.5)
+                continue
+            logger.error(f"Network error on r/{sub_name} after retry: {e}")
+            return None
+
+        if resp.status_code == 429:
+            logger.warning(f"Rate limited on r/{sub_name}, skipping this run.")
+            return None
+
+        if resp.status_code in RETRYABLE_STATUS_CODES and attempt == 1:
+            logger.warning(
+                f"Got {resp.status_code} from r/{sub_name}, retrying in 2.5s."
+            )
+            time.sleep(2.5)
+            continue
+
+        return resp
+
+    return None
 
 
 def fetch_new_posts() -> int:
@@ -62,12 +108,16 @@ def fetch_new_posts() -> int:
     inserted = 0
     headers = {"User-Agent": REDDIT_RSS_USER_AGENT}
 
-    for sub_name in SUBREDDITS:
+    # Shuffle order each run so the same subreddits don't always get hit
+    # first/last — spreads requests around more naturally over time.
+    subs = SUBREDDITS[:]
+    random.shuffle(subs)
+
+    for sub_name in subs:
         url = RSS_URL_TEMPLATE.format(subreddit=sub_name, limit=POST_LOOKBACK_LIMIT)
         try:
-            resp = requests.get(url, headers=headers, timeout=15)
-            if resp.status_code == 429:
-                logger.warning(f"Rate limited on r/{sub_name}, skipping this run.")
+            resp = _fetch_rss(url, headers, sub_name)
+            if resp is None:
                 continue
             resp.raise_for_status()
 
@@ -84,7 +134,8 @@ def fetch_new_posts() -> int:
                 title = entry.get("title", "")
                 body = _strip_html(entry.get("summary", ""))
 
-                if not passes_keyword_filter(title, body):
+                score = keyword_score(title, body)
+                if score < KEYWORD_SCORE_THRESHOLD:
                     continue
 
                 author = entry.get("author", "unknown")
@@ -106,6 +157,7 @@ def fetch_new_posts() -> int:
                     "url": entry.get("link", ""),
                     "author": author,
                     "created_utc": created_utc,
+                    "keyword_score": score,
                 }
                 insert_raw_post(post)
                 inserted += 1

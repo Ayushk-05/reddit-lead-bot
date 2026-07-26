@@ -3,11 +3,20 @@
 Personal-use pipeline. No auth, no UI, no users table. Just:
 
 ```
-cron (every 10 min) → Reddit RSS feeds (.rss, no API key) → keyword filter → Postgres (raw)
+cron (every 10 min) → Reddit RSS (newest 8/subreddit, shuffled order)
                                                         │
                                                         ▼
-                                    ONE Gemini call per post:
+                                    weighted keyword score ≥ threshold?
+                                                        │
+                                                       yes
+                                                        │
+                                                        ▼
+                                    top MAX_GEMINI_CALLS candidates by score
+                                                        │
+                                                        ▼
+                                    ONE Gemini call per candidate:
                                     qualify + score + draft outreach
+                                    (retries on transient errors, hard stop on quota)
                                                         │
                                                         ▼
                                     Postgres (analysis JSONB) → Telegram
@@ -15,6 +24,19 @@ cron (every 10 min) → Reddit RSS feeds (.rss, no API key) → keyword filter �
                                                         ▼
                                     You review, edit, copy into Reddit DM yourself
 ```
+
+Two things keep this within Gemini rate/quota limits, not one:
+1. **The keyword filter is a real gate, not a courtesy filter.** Weighted scoring
+   (`KEYWORD_SCORES` in `config.py`) — a single explicit hiring phrase clears the
+   threshold alone, implicit-only posts need several signals to co-occur. A typical
+   fetch of ~80-100 raw posts across 10 subreddits should whittle down to roughly
+   10-20 that clear the bar.
+2. **A hard cap (`MAX_GEMINI_CALLS`) on top of that.** Even if more candidates clear
+   the keyword threshold than expected, only the highest-scoring N get analyzed per
+   run — the rest wait for next run rather than burning quota indiscriminately. And
+   if Gemini returns 429 (quota exhausted) mid-run, the loop stops immediately
+   instead of cycling through guaranteed failures for every remaining candidate —
+   see `ai_classifier.QuotaExhausted`.
 
 **Nothing is ever sent to Reddit automatically.** The single Gemini call in
 `ai_classifier.py` qualifies the lead AND drafts 3 outreach variants (friendly /
@@ -33,8 +55,9 @@ surface. `reddit_fetcher.py` handles this; you don't need to do anything Reddit-
 ## Setup (~10 min)
 
 1. **Gemini API key**: go to [aistudio.google.com/apikey](https://aistudio.google.com/apikey),
-   sign in with any Google account, generate a key. No credit card, no waitlist, no approval
-   wait — this is what solves the "can't get an API key" problem from Reddit.
+   sign in with the Google account that has your **AI Pro/Ultra subscription**, generate a key.
+   Signing in with that account is what matters — the key automatically inherits your
+   subscription's higher rate limits and Gemini Pro model access, no separate billing setup.
 
 2. **Telegram bot**: message [@BotFather](https://t.me/BotFather) → `/newbot` → copy the token.
    Then message [@userinfobot](https://t.me/userinfobot) to get your own chat_id.
@@ -92,19 +115,50 @@ schema migration — e.g. `SELECT * FROM posts WHERE analysis->>'category' = 'Ba
 ## Tuning
 
 - `MIN_SCORE_TO_NOTIFY` in `.env` — raise it if you're getting noise, lower it if you're missing leads.
-- `KEYWORDS` in `config.py` — cheap pre-filter to avoid burning an API call on every single post.
-  Keep it loose. The real judgment call is the AI's job, not the keyword list's.
+- `KEYWORD_SCORE_THRESHOLD` in `.env` (default 15) — the real lever on how many posts reach
+  Gemini at all. Raise it to send fewer, higher-confidence posts; lower it if good leads are
+  getting filtered out before they ever reach Gemini. Check the logs — "Fetched N new
+  candidate posts" tells you how many cleared this bar on a given run.
+- `MAX_GEMINI_CALLS` in `.env` (default 15) — hard cap on Gemini calls per run, independent
+  of the keyword filter. Candidates are ranked by keyword score first, so if more posts clear
+  the threshold than this cap allows, the strongest ones get analyzed this run and the rest
+  wait for the next one (they don't get skipped forever). This is what actually prevents a
+  87-candidates-in-one-run situation from happening again.
+- `KEYWORD_SCORES` in `config.py` — weighted with real spread (15/8/6/4/2 tiers, not 3/2/1).
+  A single explicit hiring phrase clears the threshold alone; implicit pain-point language
+  needs several signals to co-occur in the same post. Add/reweight terms here if you notice
+  a pattern of leads you're catching or missing — e.g. add terms specific to your own stack
+  the way `trading bot` / `fastapi` are weighted higher here as profile-relevant signals.
 - `SUBREDDITS` in `config.py` — add/remove freely.
-- `GEMINI_RATE_LIMIT_DELAY` in `.env` — spacing (seconds) between analysis calls. Free tier caps
-  at ~10 requests/minute; the default 6.5s keeps you under that. Lower it if you upgrade to a
-  paid Gemini tier later.
+- `POST_LOOKBACK_LIMIT` in `.env` (default 8) — newest N posts fetched per subreddit per run,
+  not a backlog scan. Raise it if you're running cron less often than every ~10 min and want
+  to make sure busy subreddits don't outpace it.
+- `GEMINI_RATE_LIMIT_DELAY` in `.env` — spacing (seconds) between analysis calls. Google AI Pro
+  limits are well above the plain free tier's ~10 RPM, so 1.5s is a conservative default. If
+  you see 429s in the logs, raise it; if you never do, feel free to lower it further.
+
+## Migrating an existing database
+
+If you set up Postgres before this update, the `posts` table is missing the
+`keyword_score` column used for ranking candidates. Run this once:
+
+```sql
+ALTER TABLE posts ADD COLUMN IF NOT EXISTS keyword_score INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS idx_posts_keyword_score ON posts (keyword_score DESC);
+```
+
+(Also included at the bottom of `schema.sql` for reference — or just re-run
+`python init_db.py` against a fresh database.)
 
 ## Cost
 
-Free, as long as you stay on Gemini's free tier (Gemini 2.5 Flash: ~10 requests/min, 1,500/day
-as of mid-2026 — plenty for 10 subreddits polled every 10 min). No credit card attached, so
-there's no risk of an unexpected bill; you'll just start seeing 429 errors in the logs if you
-somehow exceed the daily quota, and the next cron run picks up where it left off.
+Covered by your existing Google AI Pro subscription — the API key generated from that account
+draws on your subscription's included usage rather than a separate pay-per-call bill. Using
+`gemini-2.5-pro` (set as the default model) costs more per call than the free-tier Flash models
+would, but at 10 subreddits polled every 10 min this is a light workload relative to what Pro
+includes. Watch the logs for 429s if you ever scale up subreddit count significantly — that's
+the signal to either raise `GEMINI_RATE_LIMIT_DELAY` or drop to `gemini-2.5-flash` for the
+high-volume classification pass.
 
 ## Known corners cut (on purpose, since it's just for you)
 
